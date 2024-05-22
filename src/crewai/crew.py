@@ -26,7 +26,6 @@ from crewai.task import Task
 from crewai.telemetry import Telemetry
 from crewai.tools.agent_tools import AgentTools
 from crewai.utilities import I18N, FileHandler, Logger, RPMController
-import agentops
 
 
 class Crew(BaseModel):
@@ -37,6 +36,7 @@ class Crew(BaseModel):
         tasks: List of tasks assigned to the crew.
         agents: List of agents part of this crew.
         manager_llm: The language model that will run manager agent.
+        manager_agent: Custom agent that will be used as manager.
         memory: Whether the crew should use memory to store memories of it's execution.
         manager_callbacks: The callback handlers to be executed by the manager agent when hierarchical process is used
         cache: Whether the crew should use a cache to store the results of the tools execution.
@@ -45,6 +45,7 @@ class Crew(BaseModel):
         verbose: Indicates the verbosity level for logging during execution.
         config: Configuration settings for the crew.
         max_rpm: Maximum number of requests per minute for the crew execution to be respected.
+        prompt_file: Path to the prompt json file to be used for the crew.
         id: A unique identifier for the crew instance.
         full_output: Whether the crew should return the full output with all tasks outputs or just the final output.
         task_callback: Callback to be executed after each task for every agents execution.
@@ -112,13 +113,9 @@ class Crew(BaseModel):
         default=None,
         description="Maximum number of requests per minute for the crew execution to be respected.",
     )
-    language: str = Field(
-        default="en",
-        description="Language used for the crew, defaults to English.",
-    )
-    language_file: str = Field(
+    prompt_file: str = Field(
         default=None,
-        description="Path to the language file to be used for the crew.",
+        description="Path to the prompt json file to be used for the crew.",
     )
     output_log_file: Optional[Union[bool, str]] = Field(
         default=False,
@@ -174,14 +171,23 @@ class Crew(BaseModel):
     @model_validator(mode="after")
     def check_manager_llm(self):
         """Validates that the language model is set when using hierarchical process."""
-        if self.process == Process.hierarchical and (
-            not self.manager_llm and not self.manager_agent
-        ):
-            raise PydanticCustomError(
-                "missing_manager_llm",
-                "Attribute `manager_llm` is required when using hierarchical process.",
-                {},
-            )
+        if self.process == Process.hierarchical:
+            if not self.manager_llm and not self.manager_agent:
+                raise PydanticCustomError(
+                    "missing_manager_llm_or_manager_agent",
+                    "Attribute `manager_llm` or `manager_agent` is required when using hierarchical process.",
+                    {},
+                )
+
+            if (self.manager_agent is not None) and (
+                self.agents.count(self.manager_agent) > 0
+            ):
+                raise PydanticCustomError(
+                    "manager_agent_in_agents",
+                    "Manager agent should not be included in agents list.",
+                    {},
+                )
+
         return self
 
     @model_validator(mode="after")
@@ -239,8 +245,7 @@ class Crew(BaseModel):
         self._interpolate_inputs(inputs)
         self._set_tasks_callbacks()
 
-        i18n = I18N(language=self.language, language_file=self.language_file)
-        agentops.set_parent_key("daebe730-f54d-4af5-98df-e6946fb76d13")
+        i18n = I18N(prompt_file=self.prompt_file)
 
         for agent in self.agents:
             agent.i18n = i18n
@@ -314,14 +319,14 @@ class Crew(BaseModel):
     def _run_hierarchical_process(self) -> str:
         """Creates and assigns a manager agent to make sure the crew completes the tasks."""
 
-        i18n = I18N(language=self.language, language_file=self.language_file)
-
-        try:
-            self.manager_agent.allow_delegation = (
-                True  # Forcing Allow delegation to the manager
-            )
+        i18n = I18N(prompt_file=self.prompt_file)
+        if self.manager_agent is not None:
+            self.manager_agent.allow_delegation = True
             manager = self.manager_agent
-        except:
+            if len(manager.tools) > 0:
+                raise Exception("Manager agent should not have tools")
+            manager.tools = AgentTools(agents=self.agents).tools()
+        else:
             manager = Agent(
                 role=i18n.retrieve("hierarchical_manager_agent", "role"),
                 goal=i18n.retrieve("hierarchical_manager_agent", "goal"),
@@ -358,7 +363,8 @@ class Crew(BaseModel):
     def _set_tasks_callbacks(self) -> str:
         """Sets callback for every task suing task_callback"""
         for task in self.tasks:
-            self.task_callback = task.callback
+            if not task.callback:
+                task.callback = self.task_callback
 
     def _interpolate_inputs(self, inputs: Dict[str, Any]) -> str:
         """Interpolates the inputs in the tasks and agents."""
@@ -378,7 +384,6 @@ class Crew(BaseModel):
     def _finish_execution(self, output) -> None:
         if self.max_rpm:
             self._rpm_controller.stop_rpm_counter()
-        agentops.end_session(end_state="Success", end_state_reason="Finished Execution")
         self._telemetry.end_crew(self, output)
 
     def __repr__(self):

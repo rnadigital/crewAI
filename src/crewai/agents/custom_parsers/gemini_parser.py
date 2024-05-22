@@ -1,44 +1,36 @@
 import re
-from typing import Any, Union
 
-from langchain.agents.output_parsers import ReActSingleInputOutputParser
+from typing import Union
+
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.exceptions import OutputParserException
 
-from crewai.utilities import I18N
+from ..parser import CrewAgentParser
+
 
 FINAL_ANSWER_ACTION = "Final Answer:"
 MISSING_ACTION_AFTER_THOUGHT_ERROR_MESSAGE = "I did it wrong. Invalid Format: I missed the 'Action:' after 'Thought:'. I will do right next, and don't use a tool I have already used.\n"
 MISSING_ACTION_INPUT_AFTER_ACTION_ERROR_MESSAGE = "I did it wrong. Invalid Format: I missed the 'Action Input:' after 'Action:'. I will do right next, and don't use a tool I have already used.\n"
 FINAL_ANSWER_AND_PARSABLE_ACTION_ERROR_MESSAGE = "I did it wrong. Tried to both perform Action and give a Final Answer at the same time, I must do one or the other"
 
+GEMINI_FALSE_POSITIVE_FINAL_ANSWER_PATTERN = re.compile('Final Answer[\s:\\n*]*\(.*\)\*?\*?')
 
-class CrewAgentParser(ReActSingleInputOutputParser):
-    """Parses ReAct-style LLM calls that have a single tool input.
 
-    Expects output to be in one of two formats.
-
-    If the output signals that an action should be taken,
-    should be in the below format. This will result in an AgentAction
-    being returned.
-
-    Thought: agent thought here
-    Action: search
-    Action Input: what is the temperature in SF?
-
-    If the output signals that a final answer should be given,
-    should be in the below format. This will result in an AgentFinish
-    being returned.
-
-    Thought: agent thought here
-    Final Answer: The temperature is 100 degrees
+class GeminiAgentParser(CrewAgentParser):
+    """
+    Handle Gemini output differently.
     """
 
-    _i18n: I18N = I18N()
-    agent: Any = None
-
     def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
-        includes_answer = FINAL_ANSWER_ACTION in text
+        """
+        Mostly the same as the parent's `parse` method, the only difference being that it doesn't consider
+        messages containing a placeholder 'Final Answer' to be the actual 'Final Answer'.
+        ```
+        Example:
+            ### Final Answer: \n\n**(This is where the final answer will be displayed once the user's response is processed.)**
+        ```
+        """
+        includes_answer = FINAL_ANSWER_ACTION in text and not re.search(GEMINI_FALSE_POSITIVE_FINAL_ANSWER_PATTERN, text)
         regex = (
             r"Action\s*\d*\s*:[\s]*(.*?)[\s]*Action\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
         )
@@ -68,7 +60,7 @@ class CrewAgentParser(ReActSingleInputOutputParser):
                 send_to_llm=True,
             )
         elif not re.search(
-            r"[\s]*Action\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)", text, re.DOTALL
+                r"[\s]*Action\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)", text, re.DOTALL
         ):
             self.agent.increment_formatting_errors()
             raise OutputParserException(
@@ -87,3 +79,4 @@ class CrewAgentParser(ReActSingleInputOutputParser):
                 llm_output=text,
                 send_to_llm=True,
             )
+

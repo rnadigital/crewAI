@@ -3,14 +3,16 @@ import uuid
 import json
 import asyncio
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 from datetime import datetime
 
 from langchain.agents.agent import RunnableAgent
+from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.agents.tools import tool as LangChainTool
 from langchain.tools.render import render_text_description
 from langchain_core.agents import AgentAction
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.language_models import BaseLanguageModel
 from langchain_openai import ChatOpenAI
 from pydantic import (
     UUID4,
@@ -26,15 +28,14 @@ from pydantic_core import PydanticCustomError
 
 from queue import Queue
 from crewai.agents import CacheHandler, CrewAgentExecutor, CrewAgentParser, ToolsHandler
+from crewai.agents.custom_parsers import GeminiAgentParser
 from crewai.memory.contextual.contextual_memory import ContextualMemory
 from crewai.utilities import I18N, Logger, Prompts, RPMController
 from crewai.utilities.token_counter_callback import TokenCalcHandler, TokenProcess
-from agentops.agent import track_agent
 
 import logging
 logging.basicConfig(level=(os.getenv("LOGGING_LEVEL", "debug").lower() or logging.DEBUG))
 
-@track_agent()
 class Agent(BaseModel):
     """Represents an agent in a system.
 
@@ -65,8 +66,6 @@ class Agent(BaseModel):
     _rpm_controller: RPMController = PrivateAttr(default=None)
     _request_within_rpm_limit: Any = PrivateAttr(default=None)
     _token_process: TokenProcess = TokenProcess()
-    agent_ops_agent_name: str = None
-    agent_ops_agent_id: str = None
 
     formatting_errors: int = 0
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -138,6 +137,15 @@ class Agent(BaseModel):
     callbacks: Optional[List[InstanceOf[BaseCallbackHandler]]] = Field(
         default=None, description="Callback to be executed"
     )
+    system_template: Optional[str] = Field(
+        default=None, description="System format for the agent."
+    )
+    prompt_template: Optional[str] = Field(
+        default=None, description="Prompt format for the agent."
+    )
+    response_template: Optional[str] = Field(
+        default=None, description="Response format for the agent."
+    )
 
     _original_role: str | None = None
     _original_goal: str | None = None
@@ -146,7 +154,6 @@ class Agent(BaseModel):
     def __init__(__pydantic_self__, **data):
         config = data.pop("config", {})
         super().__init__(**config, **data)
-        __pydantic_self__.agent_ops_agent_name = __pydantic_self__.role
 
     @field_validator("id", mode="before")
     @classmethod
@@ -185,7 +192,9 @@ class Agent(BaseModel):
                 self.llm.callbacks = []
 
             # Check if an instance of TokenCalcHandler already exists in the list
-            if not any(isinstance(handler, TokenCalcHandler) for handler in self.llm.callbacks):
+            if not any(
+                isinstance(handler, TokenCalcHandler) for handler in self.llm.callbacks
+            ):
                 self.llm.callbacks.append(token_handler)
 
         if not self.agent_executor:
@@ -242,7 +251,7 @@ class Agent(BaseModel):
 
         if self.step_callback:
             result_queue = Queue()
-            _thread = threading.Thread(target=self.wrap_async_func, args=(task_prompt, result_queue))
+            _thread = threading.Thread(target=self.wrap_async_func, args=(task_prompt, task.name, result_queue))
             _thread.start()
             _thread.join()
             result = result_queue.get()
@@ -260,18 +269,20 @@ class Agent(BaseModel):
 
         return result
 
-    def wrap_async_func(self, args, queue):
-        asyncio.run(self.stream_execute(args, queue))
+    def wrap_async_func(self, task_prompt, task_name, queue):
+        asyncio.run(self.stream_execute(task_prompt, task_name, queue))
 
-    async def stream_execute(self, task_prompt, result_queue):
+    async def stream_execute(self, task_prompt, task_name, result_queue):
         result = ""
         acc = ""
         chunkId = str(uuid.uuid4())
+        task_chunkId = str(uuid.uuid4())
         tool_chunkId = str(uuid.uuid4())
         first = True
         agent_name = ""
         step = 1
         try:
+            self.step_callback(f"""**Running task**: {task_name} **Available tools**: {self.agent_executor.tools_names}""", "message", True, task_chunkId, datetime.now().timestamp() * 1000, "inline")
             async for event in self.agent_executor.astream_events(
                 {
                     "input": task_prompt,
@@ -316,13 +327,13 @@ class Agent(BaseModel):
 
                         # tool chat message finished
                         case "on_chain_end":
-                            self.step_callback(acc, "message_complete", True, chunkId, datetime.now().timestamp() * 1000, "bubble", agent_name)
+                            # self.step_callback(acc, "message", True, chunkId, datetime.now().timestamp() * 1000, "bubble", agent_name)
                             chunkId = str(uuid.uuid4())
                             first = True
 
                         # tool started being used
                         case "on_tool_start":
-                            logging.debug(f"{kind}:\n{event}", flush=True)
+                            logging.info(f"{kind}:\n{event}", flush=True)
                             tool_chunkId = str(uuid.uuid4()) #TODO:
                             tool_name = event.get('name').replace('_', ' ').capitalize()
                             self.step_callback(f"Using tool: {tool_name}", "message", True, tool_chunkId, datetime.now().timestamp() * 1000, "inline")
@@ -331,18 +342,24 @@ class Agent(BaseModel):
                         case "on_tool_end":
                             logging.debug(f"{kind}:\n{event}", flush=True)
                             tool_name = event.get('name').replace('_', ' ').capitalize()
-                            self.step_callback(f"Finished using tool: {tool_name}", "message_complete", True, tool_chunkId, datetime.now().timestamp() * 1000, "inline")
-                            tool_chunkId = str(uuid.uuid4())
-
+                            self.step_callback(f"Finished using tool: {tool_name}", "message", True, tool_chunkId, datetime.now().timestamp() * 1000, "inline", None, True)
+                            if tool_name == '_Exception' or tool_name == 'exception' or tool_name == 'invalid_tool':
+                                self.step_callback(f"""Tool usage failed:
+```
+{json.dumps(event.get('data'), indent=4)}
+```
+""", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "bubble")
                         # see https://python.langchain.com/docs/expression_language/streaming#event-reference
                         case _:
                             logging.debug(f"unhandled {kind} event", flush=True)
+            self.step_callback(f"**Completed task**", "message", True, task_chunkId, datetime.now().timestamp() * 1000, "inline", None, True)
         except Exception as chunk_error:
             import sys, traceback
             exc_type, exc_value, exc_traceback = sys.exc_info()
             err_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
             logging.error(err_lines)
             tool_chunkId = str(uuid.uuid4())
+            # chunkId = str(uuid.uuid4())
             self.step_callback(f"⛔ An unexpected error occurred", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "inline")
             #TODO: if debug:
             self.step_callback(f"""Stack trace:
@@ -410,11 +427,17 @@ class Agent(BaseModel):
         }
 
         if self._rpm_controller:
-            executor_args[
-                "request_within_rpm_limit"
-            ] = self._rpm_controller.check_or_wait
+            executor_args["request_within_rpm_limit"] = (
+                self._rpm_controller.check_or_wait
+            )
 
-        prompt = Prompts(i18n=self.i18n, tools=tools).task_execution()
+        prompt = Prompts(
+            i18n=self.i18n,
+            tools=tools,
+            system_template=self.system_template,
+            prompt_template=self.prompt_template,
+            response_template=self.response_template,
+        ).task_execution()
 
         execution_prompt = prompt.partial(
             goal=self.goal,
@@ -422,11 +445,27 @@ class Agent(BaseModel):
             backstory=self.backstory,
         )
 
-        bind = self.llm.bind(stop=[self.i18n.slice("observation")])
-        inner_agent = agent_args | execution_prompt | bind | CrewAgentParser(agent=self)
+        stop_words = [self.i18n.slice("observation")]
+        if self.response_template:
+            stop_words.append(
+                self.response_template.split("{{ .Response }}")[1].strip()
+            )
+
+        bind = self.llm.bind(stop=stop_words)
+
+        parser_class = self.get_parser_class_for_llm()
+        inner_agent = agent_args | execution_prompt | bind | parser_class(agent=self)
+
         self.agent_executor = CrewAgentExecutor(
             agent=RunnableAgent(runnable=inner_agent), **executor_args
         )
+
+    def get_parser_class_for_llm(self) -> Type[ReActSingleInputOutputParser]:
+        return GeminiAgentParser if self._llm_is_gemini() else CrewAgentParser
+
+    def _llm_is_gemini(self) -> bool:
+        # not using isinstance() to avoid import and dependency on langchain-google-vertexai
+        return "model_name='gemini" in str(self.llm)
 
     def interpolate_inputs(self, inputs: Dict[str, Any]) -> None:
         """Interpolate inputs into the agent description and backstory."""
