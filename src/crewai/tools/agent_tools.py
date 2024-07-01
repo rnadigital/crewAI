@@ -65,6 +65,7 @@ class AgentTools(BaseModel):
 
         agent = agent[0]
         task = Task(
+            name=task,
             description=task,
             agent=agent,
             expected_output="Your best answer to your co-worker asking you this, accounting for the context shared.",

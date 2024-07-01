@@ -97,6 +97,8 @@ class ToolUsage:
         tool: BaseTool,
         calling: Union[ToolCalling, InstructorToolCalling],
     ) -> None:
+        self.tools_handler.on_tool_start(calling.tool_name)
+
         if self._check_tool_repeated_usage(calling=calling):
             try:
                 result = self._i18n.errors("task_repeated_usage").format(
@@ -158,6 +160,7 @@ class ToolUsage:
                     ).message
                     self.task.increment_tools_errors()
                     self._printer.print(content=f"\n\n{error_message}\n", color="red")
+                    self.tools_handler.on_tool_error(error_message)
                     return error
                 self.task.increment_tools_errors()
                 return self.use(calling=calling, tool_string=tool_string)
@@ -186,6 +189,7 @@ class ToolUsage:
             attempts=self._run_attempts,
         )
         result = self._format_result(result=result)
+        self.tools_handler.on_tool_end(calling.tool_name)
         return result
 
     def _format_result(self, result: Any) -> None:

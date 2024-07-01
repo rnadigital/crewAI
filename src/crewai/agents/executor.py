@@ -46,6 +46,7 @@ class CrewAgentExecutor(AgentExecutor):
     have_forced_answer: bool = False
     force_answer_max_iterations: Optional[int] = None
     step_callback: Optional[Any] = None
+    stop_generating_check: Optional[Any] = None
     system_template: Optional[str] = None
     prompt_template: Optional[str] = None
     response_template: Optional[str] = None
@@ -207,8 +208,8 @@ similar_tools: {similar_tools}
                     run_manager=run_manager,
                 )
 
-                if self.step_callback:
-                    self.step_callback(next_step_output)
+                # if self.step_callback:
+                #     self.step_callback(next_step_output)
 
                 if isinstance(next_step_output, AgentFinish):
                     # Creating long term memory
@@ -253,6 +254,8 @@ similar_tools: {similar_tools}
         Override this to take control of how the agent makes and acts on choices.
         """
         try:
+            if self.stop_generating_check():
+                return
             if self._should_force_answer():
                 error = self._i18n.errors("force_final_answer")
                 output = AgentAction("_Exception", error, error)

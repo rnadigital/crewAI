@@ -12,7 +12,6 @@ from langchain.agents.tools import tool as LangChainTool
 from langchain.tools.render import render_text_description
 from langchain_core.agents import AgentAction
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.language_models import BaseLanguageModel
 from langchain_openai import ChatOpenAI
 from pydantic import (
     UUID4,
@@ -29,12 +28,15 @@ from pydantic_core import PydanticCustomError
 from queue import Queue
 from crewai.agents import CacheHandler, CrewAgentExecutor, CrewAgentParser, ToolsHandler
 from crewai.agents.custom_parsers import GeminiAgentParser
+from crewai.agents.socket_stream_handler import SocketStreamHandler
 from crewai.memory.contextual.contextual_memory import ContextualMemory
 from crewai.utilities import I18N, Logger, Prompts, RPMController
 from crewai.utilities.token_counter_callback import TokenCalcHandler, TokenProcess
 
 import logging
+
 logging.basicConfig(level=(os.getenv("LOGGING_LEVEL", "debug").lower() or logging.DEBUG))
+
 
 class Agent(BaseModel):
     """Represents an agent in a system.
@@ -57,7 +59,7 @@ class Agent(BaseModel):
             allow_delegation: Whether the agent is allowed to delegate tasks to other agents.
             tools: Tools at agents disposal
             step_callback: Callback to be executed after each step of the agent execution.
-            stop_generating_check: Callback to be executed every nth chunk to check if generation should be stopped
+            stop_generating_check: Function that returns whether generation should be stopped
             callbacks: A list of callback functions from the langchain library that are triggered during the agent's execution process
     """
 
@@ -122,7 +124,7 @@ class Agent(BaseModel):
     )
     stop_generating_check: Optional[Any] = Field(
         default=None,
-        description="Callback to be executed every nth chunk to check if generation should be stopped",
+        description="Function that returns whether generation should be stopped",
     )
     i18n: I18N = Field(default=I18N(), description="Internationalization settings.")
     llm: Any = Field(
@@ -193,7 +195,7 @@ class Agent(BaseModel):
 
             # Check if an instance of TokenCalcHandler already exists in the list
             if not any(
-                isinstance(handler, TokenCalcHandler) for handler in self.llm.callbacks
+                    isinstance(handler, TokenCalcHandler) for handler in self.llm.callbacks
             ):
                 self.llm.callbacks.append(token_handler)
 
@@ -204,10 +206,10 @@ class Agent(BaseModel):
         return self
 
     def execute_task(
-        self,
-        task: Any,
-        context: Optional[str] = None,
-        tools: Optional[List[Any]] = None,
+            self,
+            task: Any,
+            context: Optional[str] = None,
+            tools: Optional[List[Any]] = None,
     ) -> str:
         """Execute a task with the agent.
 
@@ -249,126 +251,24 @@ class Agent(BaseModel):
         self.agent_executor.tools_description = render_text_description(parsed_tools)
         self.agent_executor.tools_names = self.__tools_names(parsed_tools)
 
-        if self.step_callback:
-            result_queue = Queue()
-            _thread = threading.Thread(target=self.wrap_async_func, args=(task_prompt, task.name, result_queue))
-            _thread.start()
-            _thread.join()
-            result = result_queue.get()
-        else:
-            result = self.agent_executor.invoke(
-                {
-                    "input": task_prompt,
-                    "tool_names": self.agent_executor.tools_names,
-                    "tools": self.agent_executor.tools_description,
-                }
-            )["output"]
+        socket_stream_handler = SocketStreamHandler(
+            socket_write_fn=self.step_callback,
+            agent_name=self.name, task_name=task.name,
+            tools_names=self.agent_executor.tools_names)
+
+        result = self.agent_executor.invoke(
+            {
+                "input": task_prompt,
+                "tool_names": self.agent_executor.tools_names,
+                "tools": self.agent_executor.tools_description,
+            },
+            config={'callbacks': [socket_stream_handler]}
+        )["output"]
 
         if self.max_rpm:
             self._rpm_controller.stop_rpm_counter()
 
         return result
-
-    def wrap_async_func(self, task_prompt, task_name, queue):
-        asyncio.run(self.stream_execute(task_prompt, task_name, queue))
-
-    async def stream_execute(self, task_prompt, task_name, result_queue):
-        result = ""
-        acc = ""
-        chunkId = str(uuid.uuid4())
-        task_chunkId = str(uuid.uuid4())
-        tool_chunkId = str(uuid.uuid4())
-        first = True
-        agent_name = ""
-        step = 1
-        try:
-            self.step_callback(f"""**Running task**: {task_name} **Available tools**: {self.agent_executor.tools_names}""", "message", True, task_chunkId, datetime.now().timestamp() * 1000, "inline")
-            async for event in self.agent_executor.astream_events(
-                {
-                    "input": task_prompt,
-                    "tool_names": self.agent_executor.tools_names,
-                    "tools": self.agent_executor.tools_description,
-                },
-                version="v1",
-            ):
-                    if self.stop_generating_check(step):
-                        self.step_callback(f"🛑 Stopped generating.", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "inline")
-                        return
-                    step = step + 1
-
-                    kind = event["event"]
-                    logging.debug(f"{kind}:\n{event}", flush=True)
-                    match kind:
-
-                        # message chunk
-                        case "on_chat_model_stream":
-                            content = event['data']['chunk'].content
-                            chunk = repr(content)
-                            self.step_callback(content, "message", first, chunkId, datetime.now().timestamp() * 1000, "bubble", agent_name)
-                            first = False
-                            logging.debug(f"Text chunkId ({chunkId}): {chunk}", flush=True)
-                            acc += content
-                            result += chunk
-
-                        # praser chunk
-                        case "on_parser_stream":
-                            logging.debug(f"Parser chunk ({kind}): {event['data']['chunk']}", flush=True)
-
-                        # all done
-                        case "on_llm_end":
-                            logging.debug(f"{kind}:\n{event}", flush=True)
-                            self.step_callback("", "terminate")
-
-                        # agent started, get their name
-                        case "on_chain_start":
-                            if not agent_name or len(agent_name) == 0:
-                                agent_name = self.name
-                                # agent_name = event["name"]
-
-                        # tool chat message finished
-                        case "on_chain_end":
-                            # self.step_callback(acc, "message", True, chunkId, datetime.now().timestamp() * 1000, "bubble", agent_name)
-                            chunkId = str(uuid.uuid4())
-                            first = True
-
-                        # tool started being used
-                        case "on_tool_start":
-                            logging.info(f"{kind}:\n{event}", flush=True)
-                            tool_chunkId = str(uuid.uuid4()) #TODO:
-                            tool_name = event.get('name').replace('_', ' ').capitalize()
-                            self.step_callback(f"Using tool: {tool_name}", "message", True, tool_chunkId, datetime.now().timestamp() * 1000, "inline")
-
-                        # tool finished being used
-                        case "on_tool_end":
-                            logging.debug(f"{kind}:\n{event}", flush=True)
-                            tool_name = event.get('name').replace('_', ' ').capitalize()
-                            self.step_callback(f"Finished using tool: {tool_name}", "message", True, tool_chunkId, datetime.now().timestamp() * 1000, "inline", None, True)
-                            if tool_name == '_Exception' or tool_name == 'exception' or tool_name == 'invalid_tool':
-                                self.step_callback(f"""Tool usage failed:
-```
-{json.dumps(event.get('data'), indent=4)}
-```
-""", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "bubble")
-                        # see https://python.langchain.com/docs/expression_language/streaming#event-reference
-                        case _:
-                            logging.debug(f"unhandled {kind} event", flush=True)
-            self.step_callback(f"**Completed task**", "message", True, task_chunkId, datetime.now().timestamp() * 1000, "inline", None, True)
-        except Exception as chunk_error:
-            import sys, traceback
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            err_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
-            logging.error(err_lines)
-            tool_chunkId = str(uuid.uuid4())
-            # chunkId = str(uuid.uuid4())
-            self.step_callback(f"⛔ An unexpected error occurred", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "inline")
-            #TODO: if debug:
-            self.step_callback(f"""Stack trace:
-```
-{chunk_error}
-```
-""", "message", True, str(uuid.uuid4()), datetime.now().timestamp() * 1000, "bubble")
-            pass
-        result_queue.put(acc)
 
     def set_cache_handler(self, cache_handler: CacheHandler) -> None:
         """Set the cache handler for the agent.
@@ -376,7 +276,7 @@ class Agent(BaseModel):
         Args:
             cache_handler: An instance of the CacheHandler class.
         """
-        self.tools_handler = ToolsHandler()
+        self.tools_handler = ToolsHandler(socket_write_fn=self.step_callback)
         if self.cache:
             self.cache_handler = cache_handler
             self.tools_handler.cache = cache_handler
@@ -422,6 +322,7 @@ class Agent(BaseModel):
             "max_execution_time": self.max_execution_time,
             "step_callback": self.step_callback,
             "tools_handler": self.tools_handler,
+            "stop_generating_check": self.stop_generating_check,
             "function_calling_llm": self.function_calling_llm or self.llm,
             "callbacks": self.callbacks,
         }
@@ -486,10 +387,10 @@ class Agent(BaseModel):
         self.formatting_errors += 1
 
     def format_log_to_str(
-        self,
-        intermediate_steps: List[Tuple[AgentAction, str]],
-        observation_prefix: str = "Observation: ",
-        llm_prefix: str = "",
+            self,
+            intermediate_steps: List[Tuple[AgentAction, str]],
+            observation_prefix: str = "Observation: ",
+            llm_prefix: str = "",
     ) -> str:
         """Construct the scratchpad that lets the agent continue its thought process."""
         thoughts = ""
