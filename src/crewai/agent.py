@@ -7,14 +7,12 @@ from typing import Any, List, Optional, Tuple, Type
 from langchain.agents.agent import RunnableAgent
 from langchain.agents.tools import BaseTool
 from langchain.agents.tools import tool as LangChainTool
-from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain_core.agents import AgentAction
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
 from pydantic import Field, InstanceOf, PrivateAttr, model_validator
 
 from crewai.agents import CacheHandler, CrewAgentExecutor, CrewAgentParser
-from crewai.agents.custom_parsers import GeminiAgentParser
 from crewai.agentcloud.socket_stream_handler import SocketStreamHandler
 from crewai.agents.agent_builder.base_agent import BaseAgent
 from crewai.memory.contextual.contextual_memory import ContextualMemory
@@ -322,19 +320,11 @@ class Agent(BaseAgent):
 
         bind = self.llm.bind(stop=stop_words)
 
-        parser_class = self.get_parser_class_for_llm()
-        inner_agent = agent_args | execution_prompt | bind | parser_class(agent=self)
+        inner_agent = agent_args | execution_prompt | bind | CrewAgentParser(agent=self)
 
         self.agent_executor = CrewAgentExecutor(
             agent=RunnableAgent(runnable=inner_agent), **executor_args
         )
-
-    def get_parser_class_for_llm(self) -> Type[ReActSingleInputOutputParser]:
-        return GeminiAgentParser if self._llm_is_gemini() else CrewAgentParser
-
-    def _llm_is_gemini(self) -> bool:
-        # not using isinstance() to avoid import and dependency on langchain-google-vertexai
-        return "model_name='gemini" in str(self.llm)
 
     def get_delegation_tools(self, agents: List[BaseAgent]):
         agent_tools = AgentTools(agents=agents)
