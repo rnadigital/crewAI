@@ -104,7 +104,7 @@ class AgentCloudSocketIO:
                     authorName=author_name,
                     message=Message(
                         chunkId=str(uuid4()),
-                        text=input_prompt,
+                        text="",
                         first=True,
                         tokens=1,  # Assumes 1 token is a constant value for message segmentation.
                         timestamp=datetime.now().timestamp() * 1000,
