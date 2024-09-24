@@ -81,7 +81,7 @@ class Agent(BaseAgent):
         description="Callback to be executed after each step of the agent execution.",
     )
     stop_generating_check: Optional[Any] = Field(
-        default=None,
+        default_factory=lambda: lambda: False,
         description="Function that returns whether generation should be stopped",
     )
     llm: Any = Field(
