@@ -174,6 +174,10 @@ class Crew(BaseModel):
         default=None,
         description="ID of the Agentcloud session"
     )
+    stop_generating_check: Optional[Any] = Field(
+        default_factory=lambda: lambda: False,
+        description="Function that returns whether generation should be stopped",
+    )
 
     @field_validator("id", mode="before")
     @classmethod
@@ -637,14 +641,20 @@ class Crew(BaseModel):
                 raise Exception("Manager agent should not have tools")
             manager.tools = self.manager_agent.get_delegation_tools(self.agents)
         else:
+            role = i18n.retrieve("hierarchical_manager_agent", "role")
             manager = Agent(
-                role=i18n.retrieve("hierarchical_manager_agent", "role"),
+                name=role,
+                role=role,
                 goal=i18n.retrieve("hierarchical_manager_agent", "goal"),
                 backstory=i18n.retrieve("hierarchical_manager_agent", "backstory"),
                 tools=AgentTools(agents=self.agents).tools(),
                 llm=self.manager_llm,
                 verbose=self.verbose,
+                stop_generating_check=self.stop_generating_check,
             )
+            _socket_io = AgentCloudSocketIO(self.agentcloud_socket, self.agentcloud_session_id)
+            manager.set_agentcloud_socket_io(_socket_io)
+            manager.set_tools_handler()
             self.manager_agent = manager
 
     def _execute_tasks(

@@ -241,13 +241,16 @@ class BaseAgent(ABC, BaseModel):
             self.goal = self._original_goal.format(**inputs)
             self.backstory = self._original_backstory.format(**inputs)
 
+    def set_tools_handler(self):
+        self.tools_handler = ToolsHandler(socket_io=self.agentcloud_socket_io)
+
     def set_cache_handler(self, cache_handler: CacheHandler) -> None:
         """Set the cache handler for the agent.
 
         Args:
             cache_handler: An instance of the CacheHandler class.
         """
-        self.tools_handler = ToolsHandler(socket_io=self.agentcloud_socket_io)
+        self.set_tools_handler()
         if self.cache:
             self.cache_handler = cache_handler
             self.tools_handler.cache = cache_handler
