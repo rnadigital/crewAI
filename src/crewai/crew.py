@@ -941,6 +941,10 @@ class Crew(BaseModel):
         for task in self.tasks:
             if not task.callback:
                 task.callback = self.task_callback
+            else:
+                original_callback = task.callback
+                task.callback= lambda output: (original_callback(output), self.task_callback())
+                
 
     def _interpolate_inputs(self, inputs: Dict[str, Any]) -> None:
         """Interpolates the inputs in the tasks and agents."""
