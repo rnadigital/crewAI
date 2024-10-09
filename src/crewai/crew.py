@@ -18,6 +18,7 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 from socketio import SimpleClient
+import asyncio
 
 from crewai.agent import Agent
 from crewai.agentcloud.socket_io import AgentCloudSocketIO
@@ -951,6 +952,11 @@ class Crew(BaseModel):
         for task in self.tasks:
             if not task.callback:
                 task.callback = self.task_callback
+            else:
+                original_callback = task.callback
+                task_callback = self.task_callback
+                task.callback = lambda output, oc=original_callback, tc=task_callback: (oc(output), tc())
+                
 
     def _interpolate_inputs(self, inputs: Dict[str, Any]) -> None:
         """Interpolates the inputs in the tasks and agents."""
